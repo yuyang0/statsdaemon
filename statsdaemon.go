@@ -2,7 +2,6 @@ package main
 
 import (
 	"bytes"
-	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -12,7 +11,6 @@ import (
 	"os"
 	"os/signal"
 	"runtime"
-	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -67,15 +65,8 @@ func sanitizeBucket(bucket string) string {
 
 	for i := 0; i < len(bucket); i++ {
 		c := bucket[i]
-		switch {
-		case (c >= byte('a') && c <= byte('z')) || (c >= byte('A') && c <= byte('Z')) || (c >= byte('0') && c <= byte('9')) || c == byte('-') || c == byte('.') || c == byte('_'):
-			b[bl] = c
-			bl++
-		case c == byte(' '):
-			b[bl] = byte('_')
-			bl++
-		case c == byte('/'):
-			b[bl] = byte('-')
+		if newC, ok := validCharTable[c]; ok {
+			b[bl] = newC
 			bl++
 		}
 	}
@@ -86,7 +77,9 @@ var (
 	serviceAddress    = flag.String("address", ":8125", "UDP service address")
 	tcpServiceAddress = flag.String("tcpaddr", "", "TCP service address, if set")
 	maxUdpPacketSize  = flag.Int64("max-udp-packet-size", 1472, "Maximum UDP packet size")
-	graphiteAddress   = flag.String("graphite", "127.0.0.1:2003", "Graphite service address (or - to disable)")
+	backendType       = flag.String("backend", "open-falcon", "backend used to store data(open-falcon or graphite)")
+	graphiteAddress   = flag.String("graphite", "127.0.0.1:2003", "Graphite service address")
+	openFalconAddress = flag.String("open-falcon", "127.0.0.1:1988", "open-falcon service address")
 	flushInterval     = flag.Int64("flush-interval", 10, "Flush interval (seconds)")
 	debug             = flag.Bool("debug", false, "print statistics sent to graphite")
 	showVersion       = flag.Bool("version", false, "print version string")
@@ -96,14 +89,38 @@ var (
 	percentThreshold  = Percentiles{}
 	prefix            = flag.String("prefix", "", "Prefix for all stats")
 	postfix           = flag.String("postfix", "", "Postfix for all stats")
+
+	validCharTable = make(map[byte]byte)
 )
 
 func init() {
 	flag.Var(&percentThreshold, "percent-threshold",
 		"percentile calculation for timers (0-100, may be given multiple times)")
+	for b := byte('a'); b <= byte('z'); b++ {
+		validCharTable[b] = b
+	}
+	for b := byte('A'); b <= byte('Z'); b++ {
+		validCharTable[b] = b
+	}
+	for b := byte('0'); b <= byte('9'); b++ {
+		validCharTable[b] = b
+	}
+	validCharTable[byte('_')] = byte('_')
+	validCharTable[byte('-')] = byte('-')
+	validCharTable[byte('.')] = byte('.')
+	validCharTable[byte('/')] = byte('/')
+	validCharTable[byte(',')] = byte(',')
+	validCharTable[byte('=')] = byte('=')
+
+	validCharTable[byte(' ')] = byte('_')
+}
+
+type backend interface {
+	submit(deadline time.Time) error
 }
 
 var (
+	bd              backend
 	In              = make(chan *Packet, MAX_UNPROCESSED_PACKETS)
 	counters        = make(map[string]float64)
 	gauges          = make(map[string]float64)
@@ -119,12 +136,12 @@ func monitor() {
 		select {
 		case sig := <-signalchan:
 			fmt.Printf("!! Caught signal %v... shutting down\n", sig)
-			if err := submit(time.Now().Add(period)); err != nil {
+			if err := bd.submit(time.Now().Add(period)); err != nil {
 				log.Printf("ERROR: %s", err)
 			}
 			return
 		case <-ticker.C:
-			if err := submit(time.Now().Add(period)); err != nil {
+			if err := bd.submit(time.Now().Add(period)); err != nil {
 				log.Printf("ERROR: %s", err)
 			}
 		case s := <-In:
@@ -185,175 +202,6 @@ func packetHandler(s *Packet) {
 		}
 		sets[s.Bucket] = append(sets[s.Bucket], s.ValStr)
 	}
-}
-
-func submit(deadline time.Time) error {
-	var buffer bytes.Buffer
-	var num int64
-
-	now := time.Now().Unix()
-
-	if *graphiteAddress == "-" {
-		return nil
-	}
-
-	client, err := net.Dial("tcp", *graphiteAddress)
-	if err != nil {
-		if *debug {
-			log.Printf("WARNING: resetting counters when in debug mode")
-			processCounters(&buffer, now)
-			processGauges(&buffer, now)
-			processTimers(&buffer, now, percentThreshold)
-			processSets(&buffer, now)
-		}
-		errmsg := fmt.Sprintf("dialing %s failed - %s", *graphiteAddress, err)
-		return errors.New(errmsg)
-	}
-	defer client.Close()
-
-	err = client.SetDeadline(deadline)
-	if err != nil {
-		return err
-	}
-
-	num += processCounters(&buffer, now)
-	num += processGauges(&buffer, now)
-	num += processTimers(&buffer, now, percentThreshold)
-	num += processSets(&buffer, now)
-	if num == 0 {
-		return nil
-	}
-
-	if *debug {
-		for _, line := range bytes.Split(buffer.Bytes(), []byte("\n")) {
-			if len(line) == 0 {
-				continue
-			}
-			log.Printf("DEBUG: %s", line)
-		}
-	}
-
-	_, err = client.Write(buffer.Bytes())
-	if err != nil {
-		errmsg := fmt.Sprintf("failed to write stats - %s", err)
-		return errors.New(errmsg)
-	}
-
-	log.Printf("sent %d stats to %s", num, *graphiteAddress)
-
-	return nil
-}
-
-func processCounters(buffer *bytes.Buffer, now int64) int64 {
-	var num int64
-	// continue sending zeros for counters for a short period of time even if we have no new data
-	for bucket, value := range counters {
-		fmt.Fprintf(buffer, "%s %s %d\n", bucket, strconv.FormatFloat(value, 'f', -1, 64), now)
-		delete(counters, bucket)
-		countInactivity[bucket] = 0
-		num++
-	}
-	for bucket, purgeCount := range countInactivity {
-		if purgeCount > 0 {
-			fmt.Fprintf(buffer, "%s 0 %d\n", bucket, now)
-			num++
-		}
-		countInactivity[bucket] += 1
-		if countInactivity[bucket] > *persistCountKeys {
-			delete(countInactivity, bucket)
-		}
-	}
-	return num
-}
-
-func processGauges(buffer *bytes.Buffer, now int64) int64 {
-	var num int64
-
-	for bucket, currentValue := range gauges {
-		fmt.Fprintf(buffer, "%s %s %d\n", bucket, strconv.FormatFloat(currentValue, 'f', -1, 64), now)
-		num++
-		if *deleteGauges {
-			delete(gauges, bucket)
-		}
-	}
-	return num
-}
-
-func processSets(buffer *bytes.Buffer, now int64) int64 {
-	num := int64(len(sets))
-	for bucket, set := range sets {
-
-		uniqueSet := map[string]bool{}
-		for _, str := range set {
-			uniqueSet[str] = true
-		}
-
-		fmt.Fprintf(buffer, "%s %d %d\n", bucket, len(uniqueSet), now)
-		delete(sets, bucket)
-	}
-	return num
-}
-
-func processTimers(buffer *bytes.Buffer, now int64, pctls Percentiles) int64 {
-	var num int64
-	for bucket, timer := range timers {
-		bucketWithoutPostfix := bucket[:len(bucket)-len(*postfix)]
-		num++
-
-		sort.Sort(timer)
-		min := timer[0]
-		max := timer[len(timer)-1]
-		maxAtThreshold := max
-		count := len(timer)
-
-		sum := float64(0)
-		for _, value := range timer {
-			sum += value
-		}
-		mean := sum / float64(len(timer))
-
-		for _, pct := range pctls {
-			if len(timer) > 1 {
-				var abs float64
-				if pct.float >= 0 {
-					abs = pct.float
-				} else {
-					abs = 100 + pct.float
-				}
-				// poor man's math.Round(x):
-				// math.Floor(x + 0.5)
-				indexOfPerc := int(math.Floor(((abs / 100.0) * float64(count)) + 0.5))
-				if pct.float >= 0 {
-					indexOfPerc -= 1 // index offset=0
-				}
-				maxAtThreshold = timer[indexOfPerc]
-			}
-
-			var tmpl string
-			var pctstr string
-			if pct.float >= 0 {
-				tmpl = "%s.upper_%s%s %s %d\n"
-				pctstr = pct.str
-			} else {
-				tmpl = "%s.lower_%s%s %s %d\n"
-				pctstr = pct.str[1:]
-			}
-			threshold_s := strconv.FormatFloat(maxAtThreshold, 'f', -1, 64)
-			fmt.Fprintf(buffer, tmpl, bucketWithoutPostfix, pctstr, *postfix, threshold_s, now)
-		}
-
-		mean_s := strconv.FormatFloat(mean, 'f', -1, 64)
-		max_s := strconv.FormatFloat(max, 'f', -1, 64)
-		min_s := strconv.FormatFloat(min, 'f', -1, 64)
-
-		fmt.Fprintf(buffer, "%s.mean%s %s %d\n", bucketWithoutPostfix, *postfix, mean_s, now)
-		fmt.Fprintf(buffer, "%s.upper%s %s %d\n", bucketWithoutPostfix, *postfix, max_s, now)
-		fmt.Fprintf(buffer, "%s.lower%s %s %d\n", bucketWithoutPostfix, *postfix, min_s, now)
-		fmt.Fprintf(buffer, "%s.count%s %d %d\n", bucketWithoutPostfix, *postfix, count, now)
-
-		delete(timers, bucket)
-	}
-	return num
 }
 
 type MsgParser struct {
@@ -587,6 +435,13 @@ func main() {
 		return
 	}
 
+	if *backendType == "open-falcon" {
+		bd = NewOpenFalconBackend(*openFalconAddress)
+	} else if *backendType == "graphite" {
+		bd = NewGraphiteBackend(*graphiteAddress)
+	} else {
+		log.Fatal("backend should be open-falcon or graphite.")
+	}
 	signalchan = make(chan os.Signal, 1)
 	signal.Notify(signalchan, syscall.SIGTERM)
 
