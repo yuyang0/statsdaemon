@@ -28,23 +28,25 @@ type openFalconMsg struct {
 }
 
 type openFalconBackend struct {
-	addr    string
-	postUrl string
-	packets []*openFalconMsg
+	addr           string
+	postUrl        string
+	endpointPrefix string
+	packets        []*openFalconMsg
 }
 
-func NewOpenFalconBackend(addr string) backend {
+func NewOpenFalconBackend(addr, endpointPrefix string) backend {
 	return &openFalconBackend{
-		addr:    addr,
-		postUrl: fmt.Sprintf("http://%s/v1/push", addr),
+		addr:           addr,
+		endpointPrefix: endpointPrefix,
+		postUrl:        fmt.Sprintf("http://%s/v1/push", addr),
 	}
 }
 
 func (bd *openFalconBackend) appendPacket(metric string, value float64, now int64) {
-	realMetric, tags := bd.parseMetric(metric)
+	endpoint, realMetric, tags := bd.parseMetric(metric)
 	msg := &openFalconMsg{
 		Metric:      realMetric,
-		Endpoint:    DEFAULT_ENDPOINT,
+		Endpoint:    endpoint,
 		Tags:        tags,
 		Value:       value,
 		Timestamp:   now,
@@ -194,13 +196,25 @@ func (bd *openFalconBackend) processTimers(now int64, pctls Percentiles) {
 	}
 }
 
-func (bd *openFalconBackend) parseMetric(metric string) (string, string) {
-	name := metric
-	tags := ""
+func (bd *openFalconBackend) parseMetric(metric string) (endpoint, name, tags string) {
+	endpoint = DEFAULT_ENDPOINT
+	name = metric
 	index := strings.LastIndex(metric, "/")
-	if index >= 0 {
+	if index > 0 {
 		name = metric[:index]
 		tags = metric[index+1:]
 	}
-	return name, tags
+	parts := strings.Split(name, ".")
+	endpointIdx := -1
+	for idx, part := range parts {
+		if strings.HasPrefix(part, bd.endpointPrefix) {
+			endpoint = part[len(bd.endpointPrefix):]
+			endpointIdx = idx
+		}
+	}
+	if endpointIdx >= 0 {
+		remain := append(parts[:endpointIdx], parts[endpointIdx+1:]...)
+		name = strings.Join(remain, ".")
+	}
+	return endpoint, name, tags
 }

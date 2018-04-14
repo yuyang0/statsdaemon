@@ -80,15 +80,17 @@ var (
 	backendType       = flag.String("backend", "open-falcon", "backend used to store data(open-falcon or graphite)")
 	graphiteAddress   = flag.String("graphite", "127.0.0.1:2003", "Graphite service address")
 	openFalconAddress = flag.String("open-falcon", "127.0.0.1:1988", "open-falcon service address")
-	flushInterval     = flag.Int64("flush-interval", 10, "Flush interval (seconds)")
-	debug             = flag.Bool("debug", false, "print statistics sent to graphite")
-	showVersion       = flag.Bool("version", false, "print version string")
-	deleteGauges      = flag.Bool("delete-gauges", true, "don't send values to graphite for inactive gauges, as opposed to sending the previous value")
-	persistCountKeys  = flag.Int64("persist-count-keys", 60, "number of flush-intervals to persist count keys")
-	receiveCounter    = flag.String("receive-counter", "", "Metric name for total metrics received per interval")
-	percentThreshold  = Percentiles{}
-	prefix            = flag.String("prefix", "", "Prefix for all stats")
-	postfix           = flag.String("postfix", "", "Postfix for all stats")
+	endpointPrefix    = flag.String("endpoint-prefix", "_e_", "the prefix of endpoint name")
+
+	flushInterval    = flag.Int64("flush-interval", 10, "Flush interval (seconds)")
+	debug            = flag.Bool("debug", false, "print statistics sent to graphite")
+	showVersion      = flag.Bool("version", false, "print version string")
+	deleteGauges     = flag.Bool("delete-gauges", true, "don't send values to graphite for inactive gauges, as opposed to sending the previous value")
+	persistCountKeys = flag.Int64("persist-count-keys", 60, "number of flush-intervals to persist count keys")
+	receiveCounter   = flag.String("receive-counter", "", "Metric name for total metrics received per interval")
+	percentThreshold = Percentiles{}
+	prefix           = flag.String("prefix", "", "Prefix for all stats")
+	postfix          = flag.String("postfix", "", "Postfix for all stats")
 
 	validCharTable = make(map[byte]byte)
 )
@@ -436,7 +438,7 @@ func main() {
 	}
 
 	if *backendType == "open-falcon" {
-		bd = NewOpenFalconBackend(*openFalconAddress)
+		bd = NewOpenFalconBackend(*openFalconAddress, *endpointPrefix)
 	} else if *backendType == "graphite" {
 		bd = NewGraphiteBackend(*graphiteAddress)
 	} else {
